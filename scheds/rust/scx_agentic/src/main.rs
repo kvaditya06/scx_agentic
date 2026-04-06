@@ -15,7 +15,6 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io;
 use std::io::BufRead;
 use std::mem::MaybeUninit;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
@@ -96,9 +95,10 @@ struct Opts {
 const NSEC_PER_USEC: u64 = 1_000;
 
 // Circuit breaker constants
-const CIRCUIT_BREAKER_THRESHOLD: f64 = 5.0;         // 500% of baseline triggers trip
-const CIRCUIT_BREAKER_DURATION_MS: u64 = 100;        // Market closed for 100ms
-const CIRCUIT_BREAKER_CHECK_INTERVAL_MS: u64 = 10;   // Check every 10ms
+const CIRCUIT_BREAKER_THRESHOLD: f64 = 10.0;         // 1000% of baseline triggers trip
+const CIRCUIT_BREAKER_DURATION_MS: u64 = 100;         // Market closed for 100ms
+const CIRCUIT_BREAKER_CHECK_INTERVAL_MS: u64 = 50;    // Check every 50ms (less jittery)
+const CIRCUIT_BREAKER_BASELINE_FLOOR: f64 = 10.0;     // Minimum baseline (csw/ms)
 
 // Demurrage constants
 const DEMURRAGE_INTERVAL_MS: u64 = 1;     // Apply every millisecond
@@ -398,88 +398,10 @@ struct Redistribution {
     tokens: u64,
 }
 
-struct CentralBank {
-    policy: Arc<Mutex<PolicyDecision>>,
-    telemetry: Arc<Mutex<Option<TelemetrySnapshot>>>,
-    circuit_breaker_trips: Arc<Mutex<u32>>,
-}
-
-impl CentralBank {
-    fn new() -> Self {
-        CentralBank {
-            policy: Arc::new(Mutex::new(PolicyDecision::default())),
-            telemetry: Arc::new(Mutex::new(None)),
-            circuit_breaker_trips: Arc::new(Mutex::new(0)),
-        }
-    }
-
-    // Spawn the Central Bank background thread.
-    // Uses fallback heuristic until an LLM backend is configured.
-    fn spawn(&self) {
-        let policy = Arc::clone(&self.policy);
-        let telemetry = Arc::clone(&self.telemetry);
-
-        std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(Duration::from_secs(2));
-
-                let snapshot = {
-                    let guard = telemetry.lock().unwrap();
-                    guard.clone()
-                };
-
-                let decision = match snapshot {
-                    Some(snap) => Self::fallback_heuristic(&snap),
-                    None => PolicyDecision::default(),
-                };
-
-                *policy.lock().unwrap() = decision;
-            }
-        });
-    }
-
-    // Fallback heuristic when LLM is unavailable:
-    // - Adjust demurrage based on reserve level
-    // - Redistribute to starved interactive processes
-    fn fallback_heuristic(snapshot: &TelemetrySnapshot) -> PolicyDecision {
-        let mut decision = PolicyDecision::default();
-
-        // If reserve is low (<10% of supply), increase demurrage to recycle tokens
-        let reserve_ratio = snapshot.reserve_balance as f64 / snapshot.total_supply.max(1) as f64;
-        if reserve_ratio < 0.10 {
-            decision.demurrage_rate = Some(
-                (snapshot.demurrage_rate * 1.05).min(DEMURRAGE_MAX),
-            );
-        } else if reserve_ratio > 0.50 {
-            // If reserve is high, decrease demurrage to let processes accumulate
-            decision.demurrage_rate = Some(
-                (snapshot.demurrage_rate * 0.95).max(DEMURRAGE_MIN),
-            );
-        }
-
-        // Redistribute to starved interactive processes
-        if !snapshot.top_starved.is_empty() {
-            let interactive_starved: Vec<&StarvedProcess> = snapshot
-                .top_starved
-                .iter()
-                .filter(|p| p.class == "interactive")
-                .collect();
-
-            if !interactive_starved.is_empty() {
-                // Give up to 1% of reserve to starved interactive processes
-                let budget = (snapshot.reserve_balance as f64 * 0.01) as u64;
-                if budget > 0 {
-                    decision.redistribute.push(Redistribution {
-                        target_class: "interactive".to_string(),
-                        tokens: budget,
-                    });
-                }
-            }
-        }
-
-        decision
-    }
-}
+// Central Bank communication directory
+const CENTRAL_BANK_DIR: &str = "/run/scx_agentic";
+const TELEMETRY_PATH: &str = "/run/scx_agentic/telemetry.json";
+const POLICY_PATH: &str = "/run/scx_agentic/policy.json";
 
 // Main scheduler object
 struct Scheduler<'a> {
@@ -511,8 +433,7 @@ struct Scheduler<'a> {
     prev_cpu_times: HashMap<u32, CpuTimes>,
     // Bidding agents (Phase 5)
     agents: HashMap<i32, BiddingAgent>,
-    // Central Bank (Phase 6)
-    central_bank: CentralBank,
+    // Central Bank (Phase 6) — communicates via files in /run/scx_agentic/
     circuit_breaker_trip_count: u32,
 }
 
@@ -540,8 +461,8 @@ impl<'a> Scheduler<'a> {
         let total_supply = nr_cpus * TOKENS_PER_CORE;
 
         // Designate shadow cores: last CPU as shadow (simple strategy).
-        // With NUMA awareness, would pick one per NUMA node.
-        let shadow_cpus: Vec<u32> = if nr_cpus > 1 {
+        // Need at least 4 CPUs — on small systems, shadow routing causes starvation.
+        let shadow_cpus: Vec<u32> = if nr_cpus >= 4 {
             vec![(nr_cpus - 1) as u32]
         } else {
             vec![]
@@ -571,6 +492,9 @@ impl<'a> Scheduler<'a> {
             total_supply,
         );
 
+        // Create Central Bank communication directory
+        let _ = std::fs::create_dir_all(CENTRAL_BANK_DIR);
+
         Ok(Self {
             bpf,
             opts,
@@ -596,7 +520,6 @@ impl<'a> Scheduler<'a> {
             last_ipc_sample: Instant::now(),
             prev_cpu_times: HashMap::new(),
             agents: HashMap::new(),
-            central_bank: CentralBank::new(),
             circuit_breaker_trip_count: 0,
         })
     }
@@ -1004,11 +927,22 @@ impl<'a> Scheduler<'a> {
         }
         let rate = (total_csw.saturating_sub(self.csw_last_total)) as f64 / elapsed_ms;
 
-        // Update baseline with exponential moving average
+        // Update baseline with exponential moving average (fast adaptation)
         if self.csw_baseline == 0.0 {
             self.csw_baseline = rate;
         } else {
-            self.csw_baseline = self.csw_baseline * 0.95 + rate * 0.05;
+            self.csw_baseline = self.csw_baseline * 0.80 + rate * 0.20;
+        }
+        // Floor: don't let baseline drop below natural minimum
+        if self.csw_baseline < CIRCUIT_BREAKER_BASELINE_FLOOR {
+            self.csw_baseline = CIRCUIT_BREAKER_BASELINE_FLOOR;
+        }
+
+        // Don't trip during warmup (first 2 seconds) — baseline is unstable
+        if self.schedule_cycle < 1000 {
+            self.csw_last_check = now;
+            self.csw_last_total = total_csw;
+            return;
         }
 
         // Trip if rate spikes above threshold
@@ -1198,9 +1132,27 @@ impl<'a> Scheduler<'a> {
         }
     }
 
-    // Apply the latest policy decision from the Central Bank.
+    // Write telemetry snapshot to disk for the external Central Bank daemon.
+    fn publish_telemetry(&self) {
+        let snapshot = self.build_telemetry_snapshot();
+        if let Ok(json) = serde_json::to_string_pretty(&snapshot) {
+            // Atomic write: write to tmp, then rename
+            let tmp = format!("{}.tmp", TELEMETRY_PATH);
+            if std::fs::write(&tmp, &json).is_ok() {
+                let _ = std::fs::rename(&tmp, TELEMETRY_PATH);
+            }
+        }
+    }
+
+    // Read the latest policy decision from disk (written by external Central Bank).
     fn apply_policy(&mut self) {
-        let decision = self.central_bank.policy.lock().unwrap().clone();
+        let decision = match std::fs::read_to_string(POLICY_PATH) {
+            Ok(json) => match serde_json::from_str::<PolicyDecision>(&json) {
+                Ok(d) => d,
+                Err(_) => return, // Malformed — skip this cycle
+            },
+            Err(_) => return, // No policy file yet — Central Bank hasn't started
+        };
 
         if let Some(rate) = decision.demurrage_rate {
             self.demurrage_rate = rate.clamp(DEMURRAGE_MIN, DEMURRAGE_MAX);
@@ -1246,11 +1198,19 @@ impl<'a> Scheduler<'a> {
         // Check circuit breaker every cycle
         self.check_circuit_breaker();
 
-        // If breaker is active, BPF handles dispatch directly — just drain to keep ring buffer empty
+        // If breaker is active, BPF handles NEW enqueues directly via EEVDF.
+        // But tasks already in the ring buffer still need dispatching — send them through
+        // with minimal processing to prevent stalls.
         if self.circuit_breaker_active {
             loop {
                 match self.bpf.dequeue_task() {
-                    Ok(Some(_)) => continue,
+                    Ok(Some(task)) => {
+                        let mut dispatched = DispatchedTask::new(&task);
+                        dispatched.cpu = RL_CPU_ANY;
+                        if self.bpf.dispatch_task(&dispatched).is_err() {
+                            break;
+                        }
+                    }
                     _ => break,
                 }
             }
@@ -1262,7 +1222,13 @@ impl<'a> Scheduler<'a> {
         self.apply_demurrage();
 
         self.drain_queued_tasks();
-        self.dispatch_task();
+
+        // Dispatch ALL pending tasks (not just one) to prevent order book buildup
+        while !self.order_book.book.is_empty() {
+            if !self.dispatch_task() {
+                break; // dispatch failed, stop trying
+            }
+        }
 
         // Periodic maintenance
         if self.schedule_cycle % 1000 == 0 {
@@ -1283,10 +1249,9 @@ impl<'a> Scheduler<'a> {
             );
         }
 
-        // Central Bank: publish telemetry and apply policy every 500 cycles
+        // Central Bank: publish telemetry and read policy every 500 cycles
         if self.schedule_cycle % 500 == 0 {
-            let snapshot = self.build_telemetry_snapshot();
-            *self.central_bank.telemetry.lock().unwrap() = Some(snapshot);
+            self.publish_telemetry();
             self.apply_policy();
         }
 
@@ -1303,9 +1268,10 @@ impl<'a> Scheduler<'a> {
     fn run(&mut self) -> Result<UserExitInfo> {
         let (res_ch, req_ch) = self.stats_server.channels();
 
-        // Spawn the Central Bank background thread
-        self.central_bank.spawn();
-        info!("Central Bank daemon started (fallback heuristic mode)");
+        info!(
+            "Central Bank IPC: telemetry → {} | policy ← {}",
+            TELEMETRY_PATH, POLICY_PATH
+        );
 
         while !self.bpf.exited() {
             self.schedule();
